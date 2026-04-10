@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-# app.py - Login con Browserless BQL + acquisizione cookie completi
+# app.py - Login con Browserless BQL + acquisizione cookie completi + server HTTP per download
 
 import requests
 import json
 import time
 import os
 import pickle
+import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==================== CHIAVI VALIDE ====================
 VALID_KEYS = [
@@ -83,6 +85,54 @@ REFERER_URL = "https://www.easyhits4u.com/?ref=nicolacaporale"
 OUTPUT_DIR = "/tmp/easyhits4u"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# ==================== SERVER HTTP PER DOWNLOAD COOKIE ====================
+PORT = int(os.environ.get("PORT", 10000))
+server_running = False
+
+class CookieHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/cookies':
+            try:
+                latest_path = os.path.join(OUTPUT_DIR, "cookies_latest.txt")
+                if os.path.exists(latest_path):
+                    with open(latest_path, "r") as f:
+                        cookie_string = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(cookie_string.encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"Cookie file not found yet")
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(str(e).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        pass  # silenzia i log del server
+
+def start_http_server():
+    global server_running
+    try:
+        server = HTTPServer(('0.0.0.0', PORT), CookieHandler)
+        server_running = True
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🌐 Server HTTP avviato sulla porta {PORT} - GET /cookies per scaricare la stringa cookie")
+        server.serve_forever()
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Errore avvio server: {e}")
+
+# Avvia il server in un thread separato (non blocca il resto)
+threading.Thread(target=start_http_server, daemon=True).start()
+
+# Attendi che il server sia pronto (opzionale)
+time.sleep(1)
+
+# ==================== FUNZIONI ====================
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -119,11 +169,9 @@ def get_cf_token(api_key):
         return None
 
 def build_cookie_string(cookies_dict):
-    """Costruisce una stringa cookie nel formato 'name=value; name2=value2'"""
     return '; '.join([f"{k}={v}" for k, v in cookies_dict.items()])
 
 def login_and_get_complete_cookies(api_key):
-    """Esegue login e navigazione per ottenere tutti i cookie"""
     session = requests.Session()
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/148.0',
@@ -134,16 +182,20 @@ def login_and_get_complete_cookies(api_key):
         'Upgrade-Insecure-Requests': '1',
     }
     
-    # 1. GET homepage (cookie iniziali: se, __mmapiwsid, has_account, no_auto_login)
+    # 1. GET homepage
     log("   🌐 GET homepage...")
-    home = session.get("https://www.easyhits4u.com/", headers=headers, verify=False, timeout=15)
-    log(f"      Homepage status: {home.status_code}")
-    time.sleep(1)
+    try:
+        home = session.get("https://www.easyhits4u.com/", headers=headers, verify=False, timeout=15)
+        log(f"      Homepage status: {home.status_code}")
+        time.sleep(1)
+    except Exception as e:
+        log(f"      ❌ Errore homepage: {e}")
+        return None, None, None
     
-    # 2. Ottieni token Turnstile
+    # 2. Token
     token = get_cf_token(api_key)
     if not token:
-        return None, None
+        return None, None, None   # CORRETTO: 3 valori
     
     # 3. POST login
     login_headers = headers.copy()
@@ -158,31 +210,44 @@ def login_and_get_complete_cookies(api_key):
         'password': EASYHITS_PASSWORD,
         'cf-turnstile-response': token,
     }
-    login_resp = session.post("https://www.easyhits4u.com/logon/", data=data, headers=login_headers, allow_redirects=True, timeout=30)
-    log(f"      Login POST status: {login_resp.status_code}")
-    time.sleep(1)
+    try:
+        login_resp = session.post("https://www.easyhits4u.com/logon/", data=data, headers=login_headers, allow_redirects=True, timeout=30)
+        log(f"      Login POST status: {login_resp.status_code}")
+        time.sleep(1)
+    except Exception as e:
+        log(f"      ❌ Errore POST login: {e}")
+        return None, None, None
     
-    # 4. Visita dashboard (/member/) - attiva sessione
+    # 4. GET /member/
     log("   🌐 GET /member/...")
-    member = session.get("https://www.easyhits4u.com/member/", headers=headers, verify=False, timeout=15)
-    log(f"      Member status: {member.status_code}")
-    time.sleep(1)
+    try:
+        member = session.get("https://www.easyhits4u.com/member/", headers=headers, verify=False, timeout=15)
+        log(f"      Member status: {member.status_code}")
+        time.sleep(1)
+    except Exception as e:
+        log(f"      ❌ Errore member: {e}")
+        return None, None, None
     
-    # 5. Visita /surf/ - ottiene cookie _ga, _gid, surftype
+    # 5. GET /surf/
     log("   🌐 GET /surf/...")
-    surf = session.get("https://www.easyhits4u.com/surf/", headers=headers, verify=False, timeout=15)
-    log(f"      Surf page status: {surf.status_code}")
-    time.sleep(1)
+    try:
+        surf = session.get("https://www.easyhits4u.com/surf/", headers=headers, verify=False, timeout=15)
+        log(f"      Surf page status: {surf.status_code}")
+        time.sleep(1)
+    except Exception as e:
+        log(f"      ❌ Errore surf: {e}")
+        return None, None, None
     
-    # 6. Opzionale: visita qualche altra pagina (es. stats) per cookie aggiuntivi
-    log("   🌐 GET /?ref=... (opzionale)...")
-    ref = session.get(REFERER_URL, headers=headers, verify=False, timeout=15)
-    log(f"      Referer status: {ref.status_code}")
+    # 6. GET referer (opzionale)
+    log("   🌐 GET referer...")
+    try:
+        ref = session.get(REFERER_URL, headers=headers, verify=False, timeout=15)
+        log(f"      Referer status: {ref.status_code}")
+    except Exception as e:
+        log(f"      ⚠️ Errore referer (non bloccante): {e}")
     
-    # Ottieni tutti i cookie
     cookies_dict = session.cookies.get_dict()
     cookie_string = build_cookie_string(cookies_dict)
-    
     log(f"   🍪 Cookie ottenuti: {list(cookies_dict.keys())}")
     
     if 'user_id' in cookies_dict and 'sesids' in cookies_dict:
@@ -193,39 +258,35 @@ def login_and_get_complete_cookies(api_key):
         return None, None, None
 
 def save_cookies(cookies_dict, cookie_string, session):
-    """Salva i cookie in vari formati e anche la sessione pickle"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # 1. JSON (dizionario)
+    # JSON
     json_path = os.path.join(OUTPUT_DIR, f"cookies_{timestamp}.json")
     with open(json_path, "w") as f:
         json.dump(cookies_dict, f, indent=2)
-    log(f"   💾 Cookie JSON salvati: {json_path}")
+    log(f"   💾 Cookie JSON: {json_path}")
     
-    # 2. Stringa formato cookie (per Divellaeasy)
+    # Stringa TXT
     txt_path = os.path.join(OUTPUT_DIR, f"cookie_string_{timestamp}.txt")
     with open(txt_path, "w") as f:
         f.write(cookie_string)
-    log(f"   💾 Cookie stringa salvata: {txt_path}")
+    log(f"   💾 Cookie stringa: {txt_path}")
     
-    # 3. Ultimo cookie sempre come "cookies_latest.txt"
+    # Ultimo (sovrascrive)
     latest_path = os.path.join(OUTPUT_DIR, "cookies_latest.txt")
     with open(latest_path, "w") as f:
         f.write(cookie_string)
-    log(f"   💾 Ultimo cookie aggiornato: {latest_path}")
+    log(f"   💾 Ultimo cookie: {latest_path}")
     
-    # 4. Salva la sessione (pickle) per riutilizzo con requests
+    # Sessione pickle
     session_path = os.path.join(OUTPUT_DIR, f"session_{timestamp}.pkl")
     with open(session_path, "wb") as f:
         pickle.dump(session, f)
-    log(f"   💾 Sessione pickle salvata: {session_path}")
+    log(f"   💾 Sessione pickle: {session_path}")
     
-    # 5. Copia simbolica "session_latest.pkl" (sovrascrive)
     latest_session = os.path.join(OUTPUT_DIR, "session_latest.pkl")
     with open(latest_session, "wb") as f:
         pickle.dump(session, f)
-    
-    return json_path, txt_path
 
 def main():
     log("=" * 50)
@@ -234,17 +295,22 @@ def main():
     
     for api_key in VALID_KEYS:
         log(f"🔑 Tentativo con chiave: {api_key[:10]}...")
-        
         cookies_dict, cookie_string, session = login_and_get_complete_cookies(api_key)
         if cookies_dict:
             log("🎉 Login e navigazione riusciti! Salvo cookie...")
             save_cookies(cookies_dict, cookie_string, session)
-            log("✅ Fatto. Cookie pronti per essere usati in Divellaeasy_Autosolve.py")
-            return
+            log("✅ Fatto. Cookie salvati in /tmp/easyhits4u/")
+            log(f"   🌐 Per scaricare l'ultima stringa cookie, usa: curl http://localhost:{PORT}/cookies")
+            log("   ⚠️ Il servizio rimane in esecuzione per servire il file. Premi Ctrl+C per fermarlo.")
+            # Mantieni il processo vivo per servire il file
+            while True:
+                time.sleep(60)
         else:
             log(f"   ❌ Tentativo fallito con questa chiave")
     
-    log("❌ Login fallito con tutte le chiavi")
+    log("❌ Login fallito con tutte le chiavi. Server rimane attivo per eventuali richieste.")
+    while True:
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
